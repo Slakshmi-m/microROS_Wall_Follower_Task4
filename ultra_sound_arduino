@@ -1,12 +1,10 @@
 /*
- * Arduino Nano BLE - Ultrasonic Sensor with Servo Controller
- * Assignment Mode: Alternates between WALL side and FRONT (90° rotations)
+ * Arduino Nano BLE - Ultrasonic Sensor with Continuous Servo Scanning
+ * FIXED: Servo continuously alternates between wall side and front
  * 
- * The servo will scan:
- * - 90° (Front)
- * - 0° or 180° (Wall side - automatically determined)
- * 
- * Output format: distance,angle
+ * The servo scans:
+ * - 90° (Front) - always
+ * - 0° or 180° (Wall side) - determined by which side has closer reading
  */
 
 #include <Servo.h>
@@ -18,13 +16,14 @@
 
 Servo scanServo;
 
-// Initial angles - will be modified once wall side is detected
-int frontAngle = 90;
-int wallAngle = 0;  // Start checking right side, will switch to 180 if wall is on left
+// Angles
+const int FRONT_ANGLE = 90;
+int wallAngle = 0;  // Will be set to 0 (right) or 180 (left)
 
-// Scanning state
+// State
 bool scanningFront = true;
 bool wallSideDetected = false;
+int detectionAttempts = 0;
 
 void setup() {
   Serial.begin(9600);
@@ -35,65 +34,87 @@ void setup() {
   
   // Attach servo
   scanServo.attach(SERVO_PIN);
-  scanServo.write(frontAngle); // Start at front position
+  scanServo.write(FRONT_ANGLE); // Start at front position
   
   delay(1000); // Allow servo to reach position
+  Serial.println("Arduino Nano - Starting sensor scan");
 }
 
 void loop() {
-  int currentAngle;
+  // Detect wall side in first few scans
+  if (!wallSideDetected && detectionAttempts < 10) {
+    detectWallSide();
+    detectionAttempts++;
+    return;
+  }
   
+  // If still not detected after 10 attempts, default to right side
+  if (!wallSideDetected) {
+    wallAngle = 0;
+    wallSideDetected = true;
+    Serial.println("Defaulting to RIGHT side");
+  }
+  
+  // Continuous alternating scan
   if (scanningFront) {
     // Scan front
-    currentAngle = frontAngle;
-    servoMoveAndMeasure(currentAngle);
+    scanAndReport(FRONT_ANGLE);
     scanningFront = false;
   } else {
     // Scan wall side
-    if (!wallSideDetected) {
-      // Check right side first
-      currentAngle = 0;
-      servoMoveAndMeasure(currentAngle);
-      float distRight = getDistance();
-      
-      // If wall detected on right (between 10-30cm), use right side
-      if (distRight > 10 && distRight < 30) {
-        wallAngle = 0;
-        wallSideDetected = true;
-        Serial.print(distRight);
-        Serial.print(",");
-        Serial.println(0);
-        delay(100);
-      } else {
-        // Check left side
-        currentAngle = 180;
-        servoMoveAndMeasure(currentAngle);
-        float distLeft = getDistance();
-        
-        if (distLeft > 10 && distLeft < 30) {
-          wallAngle = 180;
-          wallSideDetected = true;
-          Serial.print(distLeft);
-          Serial.print(",");
-          Serial.println(180);
-          delay(100);
-        }
-      }
-    } else {
-      // Wall side already detected, scan that side
-      currentAngle = wallAngle;
-      servoMoveAndMeasure(currentAngle);
-    }
+    scanAndReport(wallAngle);
     scanningFront = true;
   }
   
-  delay(100);
+  delay(100); // Small delay between scans
 }
 
-void servoMoveAndMeasure(int angle) {
-  // Move servo to angle
+void detectWallSide() {
+  // Measure right side (0°)
+  scanServo.write(0);
+  delay(400);
+  float distRight = getDistance();
+  
+  // Measure left side (180°)
+  scanServo.write(180);
+  delay(400);
+  float distLeft = getDistance();
+  
+  Serial.print("Detection - Right: ");
+  Serial.print(distRight);
+  Serial.print(" Left: ");
+  Serial.println(distLeft);
+  
+  // Determine which side has the wall (closer distance)
+  // Valid wall distance: 10-50cm
+  bool rightValid = (distRight > 10 && distRight < 50);
+  bool leftValid = (distLeft > 10 && distLeft < 50);
+  
+  if (rightValid && leftValid) {
+    // Both sides have readings, pick the closer one
+    wallAngle = (distRight < distLeft) ? 0 : 180;
+    wallSideDetected = true;
+    Serial.print("Wall detected on BOTH sides, using closer: ");
+    Serial.println(wallAngle == 0 ? "RIGHT" : "LEFT");
+  } else if (rightValid) {
+    wallAngle = 0;
+    wallSideDetected = true;
+    Serial.println("Wall detected on RIGHT");
+  } else if (leftValid) {
+    wallAngle = 180;
+    wallSideDetected = true;
+    Serial.println("Wall detected on LEFT");
+  }
+  
+  // Move to front position after detection
+  scanServo.write(FRONT_ANGLE);
+  delay(400);
+}
+
+void scanAndReport(int angle) {
+  // Move servo to target angle
   scanServo.write(angle);
-  delay(300); // Wait for servo to stabilize
+  delay(300); // Wait for servo to reach position
   
   // Measure distance
   float distance = getDistance();
