@@ -1,0 +1,173 @@
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Int32
+import serial
+import time
+
+class wall_follower_node(Node):
+    def __init__(self):
+        super().__init__('wall_follower_node')
+        self.publisher_ = self.create_publisher(Int32, 'micro_ros_sree_subscriber', 10)
+        self.serial_port = serial.Serial('/dev/ttyACM1', 9600, timeout=2)
+        
+        # Distance measurements
+        self.dist_wall = 0      # Distance to wall (side)
+        self.dist_front = 0     # Distance to front
+        
+        # Target distance to maintain from wall (20 cm ± 2 cm)
+        self.TARGET_DISTANCE = 20.0
+        self.DISTANCE_TOLERANCE = 2.0
+        self.OBSTACLE_THRESHOLD = 40.0  # Stop if obstacle < 40 cm in front
+        
+        # Wall following state
+        self.wall_side = None  # 'left' or 'right' - will be determined automatically
+        self.is_turning_180 = False
+        self.turn_start_time = None
+        self.TURN_180_DURATION = 3.0  # Adjust based on your robot's turn speed
+        
+        # Scan tracking
+        self.last_angle = None
+        self.scan_count = 0
+        
+        timer_period = 0.1  # seconds
+        self.timer = self.create_timer(timer_period, self.timer_callback)
+        
+        self.get_logger().info('Wall follower node started - Assignment mode')
+        self.get_logger().info('Target: 20cm ± 2cm from wall, 180° turn when obstacle < 40cm')
+
+    def timer_callback(self):
+        if self.serial_port.in_waiting > 0:
+            try:
+                data_line = self.serial_port.readline().decode('ascii').strip()
+                parts = data_line.split(',')
+                
+                if len(parts) == 2:
+                    current_distance = float(parts[0])
+                    current_angle = int(parts[1])
+                    
+                    # Store distance based on angle
+                    if current_angle == 90:
+                        self.dist_front = current_distance
+                    elif current_angle == 0:
+                        # Right side
+                        if self.wall_side == 'right' or self.wall_side is None:
+                            self.dist_wall = current_distance
+                            if self.wall_side is None and 10 < current_distance < 30:
+                                self.wall_side = 'right'
+                                self.get_logger().info('Wall detected on RIGHT side')
+                    elif current_angle == 180:
+                        # Left side
+                        if self.wall_side == 'left' or self.wall_side is None:
+                            self.dist_wall = current_distance
+                            if self.wall_side is None and 10 < current_distance < 30:
+                                self.wall_side = 'left'
+                                self.get_logger().info('Wall detected on LEFT side')
+                    
+                    # Detect scan completion (when we see front again after seeing side)
+                    if self.last_angle in [0, 180] and current_angle == 90:
+                        self.scan_count += 1
+                        if self.scan_count % 5 == 0:  # Log every 5 scans
+                            self.log_status()
+                    
+                    self.last_angle = current_angle
+                    
+                    # Calculate and publish direction
+                    direction = self.calculate_direction()
+                    msg = Int32()
+                    msg.data = direction
+                    self.publisher_.publish(msg)
+                    
+            except Exception as e:
+                self.get_logger().error(f'Error processing serial data: {e}')
+    
+    def log_status(self):
+        """Log current status periodically"""
+        status = f'Wall: {self.dist_wall:.1f}cm, Front: {self.dist_front:.1f}cm'
+        if self.dist_wall > 0:
+            error = self.dist_wall - self.TARGET_DISTANCE
+            status += f' | Error: {error:+.1f}cm'
+        self.get_logger().info(status)
+    
+    def calculate_direction(self):
+        """
+        Direction codes:
+        0 = Stop
+        1 = Forward
+        2 = Turn Right
+        3 = Turn Left
+        """
+        
+        # Handle 180° turn in progress
+        if self.is_turning_180:
+            elapsed = time.time() - self.turn_start_time
+            if elapsed < self.TURN_180_DURATION:
+                # Continue turning based on wall side
+                if self.wall_side == 'right':
+                    return 3  # Turn left for 180°
+                else:
+                    return 2  # Turn right for 180°
+            else:
+                # Turn complete, swap wall side
+                self.is_turning_180 = False
+                self.wall_side = 'left' if self.wall_side == 'right' else 'right'
+                self.get_logger().info(f'180° turn complete! Now following wall on {self.wall_side.upper()} side')
+                return 1  # Resume forward
+        
+        # Wait until we know which side the wall is on
+        if self.wall_side is None:
+            return 0  # Stop until wall is detected
+        
+        # Check for obstacle in front (< 40 cm)
+        if 0 < self.dist_front < self.OBSTACLE_THRESHOLD:
+            if not self.is_turning_180:
+                self.is_turning_180 = True
+                self.turn_start_time = time.time()
+                self.get_logger().warn(f'Obstacle detected at {self.dist_front:.1f}cm! Starting 180° turn...')
+                # Start the turn
+                if self.wall_side == 'right':
+                    return 3  # Turn left
+                else:
+                    return 2  # Turn right
+        
+        # No valid wall reading yet
+        if self.dist_wall == 0 or self.dist_wall > 100:
+            return 1  # Move forward slowly to find wall
+        
+        # Calculate error from target distance
+        error = self.dist_wall - self.TARGET_DISTANCE
+        
+        # Wall following logic with tolerance (20 cm ± 2 cm)
+        if abs(error) <= self.DISTANCE_TOLERANCE:
+            # Within acceptable range, move forward
+            return 1
+        elif error > self.DISTANCE_TOLERANCE:
+            # Too far from wall, turn toward wall
+            if self.wall_side == 'right':
+                return 2  # Turn right (toward wall)
+            else:
+                return 3  # Turn left (toward wall)
+        else:
+            # Too close to wall, turn away from wall
+            if self.wall_side == 'right':
+                return 3  # Turn left (away from wall)
+            else:
+                return 2  # Turn right (away from wall)
+
+def main(args=None):
+    rclpy.init(args=args)
+    follower_node = wall_follower_node()
+    
+    try:
+        rclpy.spin(follower_node)
+    except KeyboardInterrupt:
+        follower_node.get_logger().info('Shutting down...')
+    finally:
+        # Stop the robot
+        msg = Int32()
+        msg.data = 0
+        follower_node.publisher_.publish(msg)
+        follower_node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

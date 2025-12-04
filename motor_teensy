@@ -1,0 +1,223 @@
+/*
+ * Teensy 4.0 - micro-ROS Continuous Rotation Servo Controller with Automatic Reconnection
+ * Subscribes to direction commands and controls continuous rotation servos
+ * Automatically reconnects to micro-ROS agent without physical reset
+ */
+
+#include <Servo.h>
+#include <micro_ros_arduino.h>
+#include <stdio.h>
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <rmw_microros/rmw_microros.h>
+#include <std_msgs/msg/int32.h>
+
+// --- DEFINES ---
+#define LED_PIN 13
+
+// Macro to execute a block of code every N milliseconds
+#define EXECUTE_EVERY_N_MS(MS, X)  do { \
+  static volatile int64_t init = -1; \
+  if (init == -1) { init = uxr_millis();} \
+  if (uxr_millis() - init > MS) { X; init = uxr_millis();} \
+} while (0)
+
+// Check macro that returns false on error
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){return false;}}
+
+// --- SERVO OBJECTS ---
+Servo servoRight;
+Servo servoLeft;
+
+// Motor Pin Connections (from your code)
+constexpr int pinFeedbackLeft = 7;
+constexpr int pinFeedbackRight = 8;
+constexpr int pinControlLeft = 5;
+constexpr int pinControlRight = 6;
+
+// Servo values for continuous rotation servos
+// Adjust these based on your servo calibration
+// Typical values: 90 = stop, < 90 = one direction, > 90 = other direction
+constexpr int SERVO_STOP = 94;
+constexpr int SERVO_FORWARD_RIGHT = 89;    // Right servo forward
+constexpr int SERVO_FORWARD_LEFT = 98;   // Left servo forward (reversed)
+constexpr int SERVO_BACKWARD_RIGHT = 98; // Right servo backward
+constexpr int SERVO_BACKWARD_LEFT = 89;    // Left servo backward (reversed)
+
+// --- GLOBAL VARIABLES ---
+
+// Micro-ROS Entities
+rcl_subscription_t subscriber;
+std_msgs__msg__Int32 msg;
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_node_t node;
+
+// Connection State Machine
+enum states {
+  WAITING_AGENT,
+  AGENT_AVAILABLE,
+  AGENT_CONNECTED,
+  AGENT_DISCONNECTED
+} state;
+
+
+// --- MOTOR CONTROL FUNCTIONS ---
+
+void motors_move(int right, int left) {
+  servoRight.attach(pinControlRight);
+  servoLeft.attach(pinControlLeft);
+  servoRight.write(right);
+  servoLeft.write(left);
+  delay(50); // Short pause for servo response
+}
+
+void moveForward() {
+  motors_move(SERVO_FORWARD_RIGHT, SERVO_FORWARD_LEFT);
+}
+
+void turnRight() {
+  // Right servo backward, left servo forward
+  motors_move(SERVO_BACKWARD_RIGHT, SERVO_FORWARD_LEFT);
+}
+
+void turnLeft() {
+  // Right servo forward, left servo backward
+  motors_move(SERVO_FORWARD_RIGHT, SERVO_BACKWARD_LEFT);
+}
+
+void stopMotors() {
+  motors_move(SERVO_STOP, SERVO_STOP);
+  // Detach servos to save power and reduce jitter
+  delay(100);
+  servoRight.detach();
+  servoLeft.detach();
+}
+
+// Callback function when a message is received
+void subscription_callback(const void * msgin)
+{  
+  const std_msgs__msg__Int32 * msg = (const std_msgs__msg__Int32 *)msgin;
+  
+  switch(msg->data) {
+    case 0:
+      stopMotors();
+      break;
+    case 1:
+      moveForward();
+      break;
+    case 2:
+      turnRight();
+      break;
+    case 3:
+      turnLeft();
+      break;
+    default:
+      stopMotors();
+      break;
+  }
+}
+
+
+// --- MICRO-ROS MANAGEMENT FUNCTIONS ---
+
+bool create_entities()
+{
+  allocator = rcl_get_default_allocator();
+
+  // Initialize options
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+
+  // Create node
+  RCCHECK(rclc_node_init_default(&node, "micro_ros_motor_controller", "", &support));
+
+  // Create subscriber
+  // Subscribe to the same topic as your wall_follower.py publishes to
+  RCCHECK(rclc_subscription_init_default(
+    &subscriber,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+    "micro_ros_sree_subscriber"));
+
+  // Create executor
+  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &msg, &subscription_callback, ON_NEW_DATA));
+
+  return true;
+}
+
+void destroy_entities()
+{
+  rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+  (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+  rcl_subscription_fini(&subscriber, &node);
+  rcl_node_fini(&node);
+  rclc_executor_fini(&executor);
+  rclc_support_fini(&support);
+}
+
+
+// --- SETUP & LOOP ---
+
+void setup() {
+  set_microros_transports(); // Standard serial transport setup
+  
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(pinFeedbackRight, INPUT);
+  pinMode(pinFeedbackLeft, INPUT);
+  
+  // Stop motors initially
+  stopMotors();
+  
+  // Start in waiting state
+  state = WAITING_AGENT;
+}
+
+void loop() {
+  // State Machine for Connection Handling
+  switch (state) {
+    case WAITING_AGENT:
+      // Try to ping the agent every 500ms
+      EXECUTE_EVERY_N_MS(500, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_AVAILABLE : WAITING_AGENT;);
+      break;
+
+    case AGENT_AVAILABLE:
+      // Agent found, try to create ROS entities
+      state = (true == create_entities()) ? AGENT_CONNECTED : WAITING_AGENT;
+      if (state == WAITING_AGENT) {
+        destroy_entities(); // Clean up if creation failed
+      };
+      break;
+
+    case AGENT_CONNECTED:
+      // Check connection every 200ms
+      EXECUTE_EVERY_N_MS(200, state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_CONNECTED : AGENT_DISCONNECTED;);
+      
+      if (state == AGENT_CONNECTED) {
+        // If connected, handle ROS callbacks (this runs the motor control logic)
+        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
+      }
+      break;
+
+    case AGENT_DISCONNECTED:
+      // Connection lost, stop motors for safety, clean up memory and restart waiting
+      stopMotors();
+      destroy_entities();
+      state = WAITING_AGENT;
+      break;
+      
+    default:
+      break;
+  }
+
+  // Visual feedback: LED on when connected
+  if (state == AGENT_CONNECTED) {
+    digitalWrite(LED_PIN, HIGH);
+  } else {
+    digitalWrite(LED_PIN, LOW);
+  }
+}
